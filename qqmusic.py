@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright, TimeoutError
 from fastmcp import FastMCP
+import re
 
 # 全局配置
 MAX_RETRIES = 3           # 最大重试次数
@@ -291,25 +292,100 @@ async def get_song_details(song_id: str) -> str:
             title = await try_text(['.data__name', '.songinfo__name', '.song_detail__info h1', '.song_detail__info .songname', 'h1'])
             # 歌手
             artist = await try_text(['.data__singer', '.songinfo__singer', '.song_detail__singer', '.singer_name', '.song_detail__info .singer', '.song_detail__info .author'])
-            # 专辑
-            album = await try_text(['.data__album', '.songinfo__album', '.song_detail__album', '.album_name', '.song_detail__info .album'])
-            # 发行时间
-            release_time = await try_text(['.data__time', '.songinfo__time', '.song_detail__info .publish_time', '.song_detail__info .time', '.song_detail__info .pub_time'])
-            # 简介
-            desc = await try_text(['.song_detail__desc', '.data__desc', '.songinfo__desc', '.desc', '.song_detail__info .desc'])
-            # 歌词
-            lyrics = "暂无歌词"
-            lyric_selectors = ['.lyric__text', '.song_lyric__content', '.lyric', '.song_detail__lyric', '.songinfo__lyric']
-            for sel in lyric_selectors:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        txt = await el.text_content()
-                        if txt and txt.strip():
-                            lyrics = txt.strip()
+            # --- 新增：遍历li.data_info__item_song提取专辑和发行时间，并调试输出 ---
+            album = ""
+            release_time = ""
+            try:
+                li_list = await page.query_selector_all('li.data_info__item_song')
+                print(f"[调试] li.data_info__item_song数量: {len(li_list)}")
+                for idx, li in enumerate(li_list):
+                    txt = await li.inner_text()
+                    print(f"[调试] li[{idx}] inner_text: {txt}")
+                    a = await li.query_selector('a')
+                    if a:
+                        a_txt = await a.text_content()
+                        print(f"[调试] li[{idx}] a标签内容: {a_txt}")
+                    if txt.strip().startswith('专辑'):
+                        if a:
+                            album = a_txt or ""
+                    if txt.strip().startswith('发行时间'):
+                        lines = [line.strip() for line in txt.split('\n') if line.strip()]
+                        if lines and len(lines) > 1:
+                            release_time = lines[-1]
+            except Exception as e:
+                print(f"[调试] 遍历li.data_info__item_song出错: {str(e)}")
+            # --- END ---
+            if not album:
+                album = await try_text(['li.data_info__item_song:has-text("专辑") a', '.data__album', '.songinfo__album', '.song_detail__album', '.album_name', '.song_detail__info .album', 'a[data-stat="album_name"]'])
+            if not release_time:
+                release_time = await try_text(['li.data_info__item_song:has-text("发行时间")', '.data__time', '.songinfo__time', '.song_detail__info .publish_time', '.song_detail__info .time', '.song_detail__info .pub_time', 'span[data-stat="publish_time"]'])
+            # 3. 优先抓取data__desc_txt中的简介，循环等待内容不为空
+            desc = "暂无简介"
+            try:
+                await page.wait_for_selector('div.data__desc_txt', timeout=10000)
+                desc_el = await page.query_selector('div.data__desc_txt')
+                if desc_el:
+                    desc_text = ""
+                    for _ in range(10):
+                        desc_text = await desc_el.text_content()
+                        if desc_text and desc_text.strip():
+                            desc = desc_text.strip()
                             break
-                except Exception:
-                    continue
+                        await asyncio.sleep(0.5)
+                    print(f"[调试] desc_el: {desc_el}, desc_text: {desc_text}")
+            except Exception as e:
+                print(f"[调试] 简介抓取异常: {str(e)}")
+            # 抓取歌词前截图
+            try:
+                await page.screenshot(path='D:/Redbook-Search-Comment-MCP2.0-main/qqmusic_debug_detail_before_lyric.png')
+            except Exception as e:
+                print(f"[调试] 抓取歌词前截图失败: {str(e)}")
+            # 歌词抓取增强版
+            lyrics = "该歌曲暂无歌词"
+            try:
+                # 常见歌词选择器列表，按优先级依次尝试
+                lyric_selectors = [
+                    'div.lyric_cont a.c_tx_highlight',
+                    '.lyric__cont',
+                    '.lyric__text',
+                    '.song_lyric__content',
+                    '.lyric',
+                    '.song_detail__lyric',
+                    '.songinfo__lyric',
+                    'pre.lyric__cont',
+                    'div.lyric__cont',
+                    'div.song_lyric__content',
+                    'div.lyric',
+                    'div.song_detail__lyric',
+                    'div.songinfo__lyric'
+                ]
+                for sel in lyric_selectors:
+                    try:
+                        el = await page.query_selector(sel)
+                        if el:
+                            txt = await el.text_content()
+                            if txt and txt.strip():
+                                lyrics = txt.strip()
+                                break
+                    except Exception:
+                        continue
+                # 兼容部分歌词在pre标签
+                if (not lyrics or lyrics.strip() == '' or lyrics == '该歌曲暂无歌词'):
+                    try:
+                        pre_lyric = await page.query_selector('pre')
+                        if pre_lyric:
+                            txt = await pre_lyric.text_content()
+                            if txt and txt.strip():
+                                lyrics = txt.strip()
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[调试] 抓取歌词时异常: {str(e)}")
+            # 抓取歌词后截图
+            try:
+                await page.screenshot(path='D:/Redbook-Search-Comment-MCP2.0-main/qqmusic_debug_detail_after_lyric.png')
+            except Exception as e:
+                print(f"[调试] 抓取歌词后截图失败: {str(e)}")
             # 格式化输出
             result = f"歌曲: {title or '未知歌曲'}\n"
             result += f"歌手: {artist or '未知歌手'}\n"
@@ -416,33 +492,46 @@ async def get_artist_info(artist_id: str) -> str:
                     continue
             if not name:
                 name = "未知歌手"
-            # 3. 丰富简介选择器
+            # 3. 优先抓取data_desc_txt中的简介，直接获取纯文本内容
             desc = "暂无简介"
-            desc_selectors = ['.basic__desc', '.singer__desc', '.mod_singer_card .singer__desc']
-            for sel in desc_selectors:
-                try:
-                    desc_candidate = await page.text_content(sel)
-                    if desc_candidate:
-                        desc = desc_candidate
-                        break
-                except Exception:
-                    continue
-            # 4. 统计信息采用能取到就取，取不到就跳过
-            async def safe_text(selector):
-                try:
-                    txt = await page.text_content(selector)
-                    return txt.strip() if txt else "0"
-                except Exception:
-                    return "0"
-            song_count = await safe_text('.data__num_song')
-            album_count = await safe_text('.data__num_album')
-            mv_count = await safe_text('.data__num_mv')
-            fans_count = await safe_text('.data__num_fans')
+            try:
+                await page.wait_for_selector('div.data__desc_txt', timeout=10000)
+                desc_el = await page.query_selector('div.data__desc_txt')
+                if desc_el:
+                    desc_text = await desc_el.text_content()
+                    if desc_text and desc_text.strip():
+                        desc = desc_text.strip()
+            except Exception as e:
+                print(f"[调试] 简介抓取异常: {str(e)}")
+            # 4. 统计信息：适配mod_data_statistic结构
+            song_count = "0"
+            album_count = "0"
+            mv_count = "0"
+            try:
+                stat_root = await page.query_selector('ul.mod_data_statistic')
+                if stat_root:
+                    items = await stat_root.query_selector_all('li.data_statistic__item')
+                    for item in items:
+                        tit = await item.text_content()
+                        if '单曲' in tit:
+                            num_el = await item.query_selector('strong.data_statistic__number')
+                            if num_el:
+                                song_count = (await num_el.text_content()).strip()
+                        elif '专辑' in tit:
+                            num_el = await item.query_selector('strong.data_statistic__number')
+                            if num_el:
+                                album_count = (await num_el.text_content()).strip()
+                        elif 'MV' in tit:
+                            num_el = await item.query_selector('strong.data_statistic__number')
+                            if num_el:
+                                mv_count = (await num_el.text_content()).strip()
+            except Exception:
+                pass
+            # 格式化输出
             result = f"歌手：{name.strip()}\n\n"
             result += f"简介：\n{desc.strip()}\n\n"
             result += f"统计信息：\n"
-            result += f"单曲：{song_count} | 专辑：{album_count} | "
-            result += f"MV：{mv_count} | 粉丝：{fans_count}"
+            result += f"单曲：{song_count} | 专辑：{album_count} | MV：{mv_count}"
             return result
         except Exception as e:
             return f"获取歌手信息失败: {str(e)}\n请确认已登录QQ音乐且网络畅通，或页面结构未发生重大变化。"
@@ -539,7 +628,7 @@ async def get_song_comments(song_id: str, limit: int = 10) -> str:
         await asyncio.sleep(2)
         log_path = r"D:/Redbook-Search-Comment-MCP2.0-main/qqmusic_debug.log"
         try:
-            # 1. 点击评论按钮，弹出评论弹窗
+            # 自动点击评论按钮，确保评论区加载
             comment_btn_selectors = [
                 'button:has-text("评论")',
                 'a:has-text("评论")',
@@ -548,140 +637,62 @@ async def get_song_comments(song_id: str, limit: int = 10) -> str:
                 'span:has-text("评论")',
                 'div[data-stat="y_new.song_comment"]',
             ]
-            comment_btn = None
             for sel in comment_btn_selectors:
                 try:
                     btn = await page.query_selector(sel)
                     if btn and await btn.is_visible():
-                        comment_btn = btn
+                        await btn.click()
+                        await asyncio.sleep(2)
                         break
                 except Exception:
                     continue
-            if comment_btn:
-                await comment_btn.click()
-                await asyncio.sleep(2)
-            else:
-                print("[调试] 未找到评论按钮，直接尝试抓取页面评论区")
+            # 多次滚动页面，确保评论区异步加载
+            for _ in range(5):
+                await page.mouse.wheel(0, 1000)
+                await asyncio.sleep(1)
 
-            # 2. 评论弹窗内Tab选择器
-            tab_selectors = {
-                'hot': ['li:has-text("热门")', 'div.tab__item:has-text("热门")', 'button:has-text("热门")'],
-                'new': ['li:has-text("最新")', 'div.tab__item:has-text("最新")', 'button:has-text("最新")'],
-            }
-            # 3. 评论内容区选择器（弹窗/主页面都兼容）
-            comment_list_selectors = [
-                '.comment__list', '.mod_comment_list', '.comment-list', '.mod_comment', '.popup__comment_list', '.popup_comment_list'
-            ]
-            comment_item_selectors = [
-                '.comment__item', '.mod_comment_item', '.comment-item', '.comment-list-item', '.popup__comment_item', '.popup_comment_item'
-            ]
-            def format_comments(title, comments):
-                if not comments:
-                    return f"{title}：暂无评论。\n"
-                result = f"{title}：\n\n"
-                for i, c in enumerate(comments, 1):
-                    result += f"{i}. {c['user']}：{c['content']}\n   时间：{c['time']}\n"
-                    if i < len(comments):
-                        result += "\n"
-                return result
-            all_results = []
-            for tab, tab_names in [('热门评论', tab_selectors['hot']), ('最新评论', tab_selectors['new'])]:
-                # 切换Tab
-                tab_found = False
-                for sel in tab_names:
-                    try:
-                        tab_btn = await page.query_selector(sel)
-                        if tab_btn and await tab_btn.is_visible():
-                            await tab_btn.click()
-                            await asyncio.sleep(2)
-                            tab_found = True
-                            break
-                    except Exception:
-                        continue
-                if not tab_found:
-                    print(f"[调试] 未找到{tab}Tab，尝试直接抓取")
-                # 滚动加载
-                for _ in range(3):
-                    await page.mouse.wheel(0, 1000)
-                    await asyncio.sleep(1)
-                # 抓取评论
-                comment_elements = []
-                for list_sel in comment_list_selectors:
-                    try:
-                        await page.wait_for_selector(list_sel, timeout=3000)
-                        for item_sel in comment_item_selectors:
-                            elements = await page.query_selector_all(f"{list_sel} {item_sel}")
-                            if elements:
-                                comment_elements = elements
-                                break
-                        if comment_elements:
-                            break
-                    except Exception:
-                        continue
-                # 兜底
-                if not comment_elements:
-                    for item_sel in comment_item_selectors:
-                        try:
-                            elements = await page.query_selector_all(item_sel)
-                            if elements:
-                                comment_elements = elements
-                                break
-                        except Exception:
-                            continue
-                comments = []
-                for i, element in enumerate(comment_elements):
-                    if i >= limit:
-                        break
-                    try:
-                        user = await element.query_selector('.comment__user, .user__name, .comment-user, .user-name')
-                        user_name = await user.text_content() if user else "匿名用户"
-                        content = await element.query_selector('.comment__content, .comment-content, .content, .comment_text')
-                        comment_text = await content.text_content() if content else ""
-                        time_el = await element.query_selector('.comment__time, .comment-time, .time')
-                        comment_time = await time_el.text_content() if time_el else ""
-                        comments.append({
-                            'user': user_name.strip(),
-                            'content': comment_text.strip(),
-                            'time': comment_time.strip()
-                        })
-                    except Exception as e:
-                        # 写入调试日志
-                        try:
-                            with open(log_path, "a", encoding="utf-8") as f:
-                                f.write(f"[调试] 提取{tab}信息时出错: {str(e)}\n")
-                            print(f"已写入调试日志: {log_path}", flush=True)
-                        except Exception as log_e:
-                            print(f"写日志失败: {log_e}", flush=True)
-                        continue
-                if not comments:
-                    # 输出页面结构片段到日志
-                    try:
-                        html = await page.evaluate('(el) => el.innerHTML', await page.query_selector('body'))
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(f"[调试] {tab}未找到评论，页面body片段：\n{html[:2000]}\n\n")
-                        print(f"已写入调试日志: {log_path}", flush=True)
-                    except Exception as e:
-                        try:
-                            with open(log_path, "a", encoding="utf-8") as f:
-                                f.write(f"[调试] 获取页面HTML片段失败: {str(e)}\n")
-                            print(f"已写入调试日志: {log_path}", flush=True)
-                        except Exception as log_e:
-                            print(f"写日志失败: {log_e}", flush=True)
-                all_results.append(format_comments(tab, comments))
-            # 主流程结尾：无论如何都写一次页面结构到日志
+            # 参考歌手详情的方式，直接遍历评论区结构
+            comments = []
             try:
-                html = await page.evaluate('(el) => el.innerHTML', await page.query_selector('body'))
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"[调试] 主流程结尾页面body片段：\n{html[:2000]}\n\n")
-                print(f"已写入调试日志: {log_path}", flush=True)
+                # 遍历所有评论区（精彩评论和近期热评）
+                comment_blocks = await page.query_selector_all('div.mod_hot_comment ul.comment__list')
+                for block in comment_blocks:
+                    items = await block.query_selector_all('li.comment__list_item.c_b_normal')
+                    for element in items:
+                        try:
+                            user_el = await element.query_selector('h4.comment__title')
+                            user_name = await user_el.text_content() if user_el else "匿名用户"
+                            time_el = await element.query_selector('div.comment__date')
+                            comment_time = await time_el.text_content() if time_el else ""
+                            content_el = await element.query_selector('p.comment__text > span')
+                            content_html = await content_el.inner_html() if content_el else ""
+                            def img_to_title(match):
+                                title = re.search(r'title="([^"]+)"', match.group(0))
+                                return title.group(1) if title else ""
+                            content = re.sub(r'<img[^>]*>', img_to_title, content_html)
+                            content = re.sub(r'<br\s*/?>', '\n', content)
+                            content = re.sub(r'<[^>]+>', '', content)
+                            content = content.strip()
+                            like_el = await element.query_selector('a.comment__zan')
+                            like_count = await like_el.text_content() if like_el else ""
+                            comments.append({
+                                'user': user_name.strip(),
+                                'content': content,
+                                'time': comment_time.strip(),
+                                'like': like_count.strip()
+                            })
+                        except Exception as e:
+                            print(f"[调试] 评论提取异常: {str(e)}")
+                            continue
             except Exception as e:
-                try:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"[调试] 主流程结尾获取页面HTML片段失败: {str(e)}\n")
-                    print(f"已写入调试日志: {log_path}", flush=True)
-                except Exception as log_e:
-                    print(f"写日志失败: {log_e}", flush=True)
-            return '\n'.join(all_results)
+                print(f"[调试] 评论区结构提取异常: {str(e)}")
+            # 格式化输出
+            if not comments:
+                return "未找到任何评论，可能是页面结构变化或评论区为空。"
+            result = "评论：\n\n"
+            for i, c in enumerate(comments, 1):
+                result += f"{i}. {c['user']}（{c['time']}，赞{c['like']}）\n{c['content']}\n\n"
+            return result
         except Exception as e:
             try:
                 html = await page.evaluate('(el) => el.innerHTML', await page.query_selector('body'))
@@ -698,88 +709,7 @@ async def get_song_comments(song_id: str, limit: int = 10) -> str:
             return f"获取歌曲评论失败: {str(e)}"
     return await retry_action(_get_song_comments)
 
-@mcp.tool()
-async def post_song_comment(song_id: str, comment: str) -> str:
-    """
-    在指定歌曲下发表评论
-    Args:
-        song_id: 歌曲ID
-        comment: 要发布的评论内容
-    """
-    async def _post_song_comment():
-        song_url = f"https://y.qq.com/n/ryqq/songDetail/{song_id}"
-        await page.goto(song_url, timeout=PAGE_LOAD_TIMEOUT)
-        await asyncio.sleep(2)
-        try:
-            # 优先查找QQ音乐新版评论输入框
-            input_selectors = [
-                'div.comment__textarea_default.c_tx_normal[contenteditable="true"]',
-                'div[contenteditable="true"]',
-                'textarea.comment__textarea',
-                'textarea[placeholder*="说点什么"]',
-                '.comment__textarea',
-                'textarea'
-            ]
-            comment_input = None
-            for selector in input_selectors:
-                try:
-                    # 先用query_selector获取ElementHandle
-                    element = await page.query_selector(selector)
-                    if element:
-                        comment_input = element
-                        break
-                except Exception:
-                    continue
-            if not comment_input:
-                return "未能找到评论输入框，无法发表评论。"
-            await comment_input.click()
-            await asyncio.sleep(1)
-            # 确保comment_input为ElementHandle，evaluate调用无参数数量错误
-            try:
-                await comment_input.evaluate(
-                    '''(el, text) => {
-                        el.innerText = text;
-                        el.textContent = text;
-                        el.value = text;
-                        el.dispatchEvent(new Event("input", {bubbles:true}));
-                        el.dispatchEvent(new Event("compositionend", {bubbles:true}));
-                        el.dispatchEvent(new Event("change", {bubbles:true}));
-                    }''',
-                    comment
-                )
-                print("[调试] 已用ElementHandle.evaluate设置评论内容并触发事件")
-            except Exception as e:
-                print(f"[调试] evaluate设置评论内容失败: {str(e)}")
-                return f"evaluate设置评论内容失败: {str(e)}"
-            await asyncio.sleep(1)
-            # 尝试点击发送按钮
-            send_selectors = [
-                'button.comment__btn_send',
-                'button:has-text("发送")',
-                'button[aria-label*="发送"]',
-                'button',
-                '.comment__btn_send',
-                '.mod_comment_send',
-                'a.comment__btn_send'
-            ]
-            send_success = False
-            for selector in send_selectors:
-                try:
-                    send_btn = await page.query_selector(selector)
-                    if send_btn and await send_btn.is_enabled():
-                        await send_btn.click()
-                        await asyncio.sleep(2)
-                        send_success = True
-                        break
-                except Exception:
-                    continue
-            if send_success:
-                return f"已成功发表评论：{comment}"
-            else:
-                return "未能成功点击发送按钮，评论可能未发布。"
-        except Exception as e:
-            return f"发表评论时出错: {str(e)}"
-    return await retry_action(_post_song_comment)
+
 
 if __name__ == "__main__":
     # 初始化并运行服务器
